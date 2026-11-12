@@ -41,13 +41,10 @@
 -- your language cases them its own way. Angles are degrees from the +x
 -- axis; pitch is positive up.
 -- Manual: https://clunkyard.com/manual#sdk
-{-# LANGUAGE BangPatterns #-}
 module Main where
 import Clunkyard
 import Foreign
 import Foreign.C
-import Data.Bits
-import Data.Word
 import Data.IORef
 import Control.Monad
 
@@ -65,14 +62,6 @@ scan robot heading arc pitch = do
 showStatus robot text value = do
   withText text (cyStatusText robot) >>= check robot
   forM_ value $ \number -> cyStatusValue robot number >>= check robot
--- The arena's calibration kernel, xorshift-sqrt v1; safe to delete.
-calibrationWork :: Int -> Int -> CDouble
-calibrationWork work tick = fromIntegral ((floor total + fromIntegral (shiftR final 40)) `mod` (1000000 :: Integer))
-  where
-    (final,total) = go work (88172645463325252 `xor` fromIntegral tick) 0
-    go :: Int -> Word64 -> Double -> (Word64,Double)
-    go 0 x total = (x,total)
-    go n !x !total = let a=x `xor` shiftL x 13; b=a `xor` shiftR a 7; c=b `xor` shiftL b 17 in go (n-1) c (total+sqrt (fromIntegral (shiftR c 11)))
 start free robot = do
   is3d <- query robot (cyMatchIs3d robot)
   gravity <- query robot (cyArenaGravity robot)
@@ -148,9 +137,6 @@ turnBot free robot = do
         yaw <- steer robot bearing heading 30
         climb <- query robot (cyAnglesClamp ((elevation-pitch)/30) (-1) 1)
         drive robot 0.8 yaw climb
-  -- Only the arena's rate calibration sends this; safe to delete.
-  work <- withText "state.calibration.work" $ \path count -> optional robot (cyRawNumber robot path count)
-  forM_ work $ \n -> when (n >= 1 && n == fromInteger (floor n)) $ showStatus robot "WORK" (Just (calibrationWork (floor n) (fromIntegral tick)))
 main = do
   free <- newIORef False
   run (turnBot free) (start free)
