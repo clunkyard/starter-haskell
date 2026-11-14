@@ -16,7 +16,7 @@
 --   reload_ticks(power) shot_damage(power) power_for_speed(speed)
 --   power_for_flight_time(range seconds) lead(contact power)
 --   lead_point(position velocity power)
--- scanner: last proximity_range reach(arc) arc_for_reach(range)
+-- scanner: last proximity_range reach(arc) arc_for_reach(range) is_on
 -- sensors: contacts nearest cues contact(slot) position_of(contact)
 -- tracker: cue nearest_bearing_rate velocity(slot) position(slot)
 --   last_seen(slot)
@@ -34,7 +34,7 @@
 -- Controls: drive.set(throttle turn pitch_turn)
 --   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
 --   gun.aim(heading pitch) gun.fire(power) scanner.set(heading arc pitch)
---   tracker.configure(smoothing forget_ticks cue_ticks)
+--   scanner.power(on) tracker.configure(smoothing forget_ticks cue_ticks)
 --   status.set(text value) raw.extra(json)
 -- Every control argument is optional; a second call keeps what the first
 -- set. Absent facts are your language's none. Names are snake_case here;
