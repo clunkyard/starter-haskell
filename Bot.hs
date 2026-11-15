@@ -1,5 +1,10 @@
 -- A robot on the Clunkyard core's Haskell binding. The core owns tracking,
 -- geometry and protocol handling; this strategy chooses the tactics.
+-- Bearing is earned: a scan contact's bearing is off by up to its
+-- bearing error (degrees, a fixed share of the arc), so a wide beam finds a
+-- robot and a narrow one aims at it. The robot narrows the beam, holds it
+-- on the target and aims along a line fitted through its recent sightings.
+-- Contacts within 120 units are exact.
 -- Clunkyard robot API 2.0.0: one core under every language, the same
 -- answers everywhere. Facts (a call shows its arguments):
 -- match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -50,6 +55,17 @@ import Foreign.C
 import Data.IORef
 import Control.Monad
 
+searchArc, holdWidth, minArc :: CDouble
+searchArc = 40  -- degrees: sweeps the circle in half a second
+holdWidth = 60  -- units across at the target: it stays in the beam from tick to tick
+minArc = 6      -- degrees: the narrowest the beam holds
+window, lookEvery, reacquire :: CInt
+window = 12     -- ticks of sightings the aim averages
+lookEvery = 40  -- ticks between looks around the target, for a nearer robot
+reacquire = 10  -- ticks to look again where a lost target was
+sightings :: Int
+sightings = 8   -- narrow sightings in the window before a shot
+
 steer robot target current scale = do
   delta <- query robot (cyAnglesAngleDiff target current)
   query robot (cyAnglesClamp (delta / scale) (-1) 1)
@@ -70,11 +86,33 @@ heardShot robot = allocaArray 64 $ \buffer -> alloca $ \count -> do
   n <- peek count
   cues <- peekArray (min 64 (fromIntegral n)) buffer
   pure (any ((== cySourceMuzzle) . contactSource) cues)
+-- A straight line through the narrowest of the last window ticks' sightings:
+-- where the robot is now and how fast it moves, and how many sightings it
+-- rests on. Each sighting is off by its bearing error; the line averages that out.
+fitLine :: CInt -> CInt -> [CySighting] -> Maybe (CyVec3, CyVec3, Int)
+fitLine tick rate history
+  | length recent < 2 || length seen < 2 = Nothing
+  | otherwise = Just (CyVec3 px py pz, CyVec3 vx vy vz, length seen)
+  where
+    recent = filter ((> tick - window) . sightingTick) history
+    best = minimum (map sightingBearingError recent)
+    seen = filter ((<= 1.5 * best) . sightingBearingError) recent -- the narrow ones
+    n = fromIntegral (length seen) :: Double
+    ticks = map (fromIntegral . sightingTick) seen :: [Double]
+    t0 = sum ticks / n
+    spread = sum [(t - t0) ^ (2 :: Int) | t <- ticks]
+    -- One axis: the line's position now and its slope per tick.
+    axis along = (realToFrac (mean + slope * (fromIntegral tick - t0)), realToFrac (slope * fromIntegral rate))
+      where
+        points = map (realToFrac . along . sightingPosition) seen :: [Double]
+        mean = sum points / n
+        slope = sum (zipWith (\t p -> (t - t0) * (p - mean)) ticks points) / spread
+    ((px, vx), (py, vy), (pz, vz)) = (axis vec3X, axis vec3Y, axis vec3Z)
 start free robot = do
   is3d <- query robot (cyMatchIs3d robot)
   gravity <- query robot (cyArenaGravity robot)
   writeIORef free (is3d /= 0 && vec3Z gravity == 0)
-turnBot free dodging robot = do
+turnBot free dodging slot robot = do
   freeFlight <- readIORef free
   position <- query robot (cyMePosition robot)
   heading <- query robot (cyMeHeading robot)
@@ -88,41 +126,80 @@ turnBot free dodging robot = do
       yaw <- steer robot (contactBearing t) heading 45
       climb <- steer robot (contactElevation t) pitch 45
       drive robot throttle yaw climb
-      scan robot (contactBearing t) 20 (contactElevation t)
+      writeIORef slot (contactSlot t)
+      -- Halve the beam each tick until it is holdWidth across at the target:
+      -- narrow enough for a precise bearing, wide enough to keep it in.
+      lastArc <- scanArc <$> query robot (cyScannerLast robot)
+      let hold = max minArc (2 * atan2 (holdWidth/2) (contactRange t) * 180 / pi)
+          -- In a crowd a narrow beam sees one robot. Every lookEvery ticks,
+          -- widen it for a tick: a nearer robot it finds becomes the target.
+          arc = if tick `mod` lookEvery == 0 then searchArc else max hold (min searchArc (lastArc/2))
+      scan robot (contactBearing t) arc (contactElevation t)
       power <- query robot (cyGunPowerForFlightTime robot (contactRange t) 1)
-      -- cyGunLead is the intercept if the target holds course.
-      solution <- with t $ \ptr -> optional robot (cyGunLead robot ptr power)
+      -- An exact contact: cyGunLead is the intercept if the target holds course.
+      -- A noisy one: lead the fitted line, and fire only once it rests on enough sightings.
+      (solution,ready) <- if contactBearingError t > 0
+        then do
+          rate <- query robot (cyMatchTickRate robot)
+          recorded <- allocaArray 32 $ \buffer -> alloca $ \count -> do
+            cyTrackerHistory robot (contactSlot t) buffer 32 count >>= check robot
+            n <- peek count
+            peekArray (min 32 (fromIntegral n)) buffer
+          case fitLine tick rate recorded of
+            Nothing -> pure (Nothing,False)
+            Just (spot,velocity,count) -> do
+              lead <- with spot $ \point -> with velocity $ \speed -> optional robot (cyGunLeadPoint robot point speed power)
+              pure (lead,count >= sightings)
+        else do
+          lead <- with t $ \ptr -> optional robot (cyGunLead robot ptr power)
+          pure (lead,True)
       let (aimHeading,aimPitch) = maybe (contactBearing t,contactElevation t) (\s -> (solutionHeading s,solutionPitch s)) solution
       cyGunAimHeading robot aimHeading >>= check robot
       cyGunAimPitch robot aimPitch >>= check robot
       now <- query robot (cyGunAimNow robot)
       delta <- query robot (cyAnglesAngleDiff aimHeading (directionHeading now))
       canFire <- query robot (cyGunCanFire robot power 10)
-      when (abs delta < 3 && abs (aimPitch-directionPitch now) < 3 && canFire /= 0) $ do
+      when (ready && abs delta < 3 && abs (aimPitch-directionPitch now) < 3 && canFire /= 0) $ do
         cyGunFire robot >>= check robot
         cyGunPower robot power >>= check robot
-      showStatus robot "TRACK" (Just (contactRange t))
+      showStatus robot (if ready then "TRACK" else "NARROW") (Just (contactRange t))
     Nothing -> do
-      heard <- optional robot (cyTrackerCue robot)
-      case heard of
-        Just cue -> with position $ \pos -> with (cuePosition cue) $ \point -> do
-          bearing <- query robot (cyAnglesBearingTo pos point)
-          distance <- query robot (cyAnglesDistance pos point)
-          elevation <- if freeFlight then query robot (cyAnglesElevationTo pos point) else pure 0
-          let spread=min (cueBearingError cue) 30; across=fromIntegral (tick `mod` 5-2)/2*spread; up=if freeFlight then fromIntegral ((tick `div` 5) `mod` 3-1)*spread/2 else 0
-          yaw <- steer robot bearing heading 45
-          climb <- steer robot elevation pitch 45
-          drive robot 0.7 yaw climb
-          arc <- query robot (cyScannerArcForReach robot (distance+100))
-          scan robot (bearing+across) arc (elevation+up)
-          showStatus robot "CUE" (Just distance)
-        Nothing -> do
-          lastScan <- query robot (cyScannerLast robot)
-          sweep <- query robot (cyAnglesNormalize (scanHeading lastScan+36))
-          climb <- steer robot 0 pitch 45
-          drive robot 0.5 0.33 climb
-          scan robot sweep 40 (if freeFlight then fromIntegral ((tick `div` 10) `mod` 3-1)*35 else 0)
-          showStatus robot "SEARCH" Nothing
+      seen <- readIORef slot
+      lastSeen <- if seen == 0 then pure Nothing else optional robot (cyTrackerLastSeen robot seen)
+      case lastSeen of
+        Just at | tick - at <= reacquire -> do
+          -- Lost it: look again where it was last seen, widening the beam, before searching.
+          remembered <- optional robot (cyTrackerPosition robot seen)
+          lastArc <- scanArc <$> query robot (cyScannerLast robot)
+          with position $ \pos -> with (maybe position id remembered) $ \point -> do
+            bearing <- query robot (cyAnglesBearingTo pos point)
+            elevation <- if freeFlight then query robot (cyAnglesElevationTo pos point) else pure 0
+            yaw <- steer robot bearing heading 45
+            climb <- steer robot elevation pitch 45
+            drive robot 0.5 yaw climb
+            scan robot bearing (min searchArc (lastArc*2)) elevation
+            showStatus robot "REACQUIRE" Nothing
+        _ -> do
+          heard <- optional robot (cyTrackerCue robot)
+          case heard of
+            Just cue -> with position $ \pos -> with (cuePosition cue) $ \point -> do
+              bearing <- query robot (cyAnglesBearingTo pos point)
+              distance <- query robot (cyAnglesDistance pos point)
+              elevation <- if freeFlight then query robot (cyAnglesElevationTo pos point) else pure 0
+              let spread=min (cueBearingError cue) 30; across=fromIntegral (tick `mod` 5-2)/2*spread; up=if freeFlight then fromIntegral ((tick `div` 5) `mod` 3-1)*spread/2 else 0
+              yaw <- steer robot bearing heading 45
+              climb <- steer robot elevation pitch 45
+              drive robot 0.7 yaw climb
+              arc <- query robot (cyScannerArcForReach robot (distance+100))
+              scan robot (bearing+across) arc (elevation+up)
+              showStatus robot "CUE" (Just distance)
+            Nothing -> do
+              lastScan <- query robot (cyScannerLast robot)
+              sweep <- query robot (cyAnglesNormalize (scanHeading lastScan+36))
+              climb <- steer robot 0 pitch 45
+              drive robot 0.5 0.33 climb
+              scan robot sweep searchArc (if freeFlight then fromIntegral ((tick `div` 10) `mod` 3-1)*35 else 0)
+              showStatus robot "SEARCH" Nothing
   -- A simple dodge: vary it, or predict the shooter.
   (taken,ends) <- readIORef dodging
   shot <- if tick >= ends then heardShot robot else pure False
@@ -162,4 +239,5 @@ turnBot free dodging robot = do
 main = do
   free <- newIORef False
   dodging <- newIORef (0, 0) -- dodges taken, and the tick the current one ends
-  run (turnBot free dodging) (start free)
+  slot <- newIORef 0 -- the last target's slot, for looking again where it was lost
+  run (turnBot free dodging slot) (start free)
