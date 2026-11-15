@@ -7,7 +7,8 @@
 -- clock: tick seconds remaining_ticks
 -- arena: size gravity terrain_kind ground_height(x y)
 -- me: health position velocity heading pitch roll angular_velocity
---   attitude grounded altitude applied
+--   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+--   from_mount(heading pitch) mount_toward(point)
 -- battery: charge capacity regen sustainable_drive compute
 --   drive_cost(fraction)
 -- drive: hover_lift
@@ -29,7 +30,8 @@
 -- score: me best armour
 -- angles: normalize(degrees) angle_diff(target current)
 --   bearing_to(from to) elevation_to(from to) direction(heading pitch)
---   distance(a b) clamp(value low high)
+--   distance(a b) to_chassis(heading pitch attitude)
+--   from_chassis(heading pitch attitude) clamp(value low high)
 -- raw: number(path) text(path) has(path) flag(path) count(path) line()
 -- Controls: drive.set(throttle turn pitch_turn)
 --   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -62,11 +64,17 @@ scan robot heading arc pitch = do
 showStatus robot text value = do
   withText text (cyStatusText robot) >>= check robot
   forM_ value $ \number -> cyStatusValue robot number >>= check robot
+-- Whether this tick's passive contacts include a shot heard.
+heardShot robot = allocaArray 64 $ \buffer -> alloca $ \count -> do
+  cySensorsCues robot buffer 64 count >>= check robot
+  n <- peek count
+  cues <- peekArray (min 64 (fromIntegral n)) buffer
+  pure (any ((== cySourceMuzzle) . contactSource) cues)
 start free robot = do
   is3d <- query robot (cyMatchIs3d robot)
   gravity <- query robot (cyArenaGravity robot)
   writeIORef free (is3d /= 0 && vec3Z gravity == 0)
-turnBot free robot = do
+turnBot free dodging robot = do
   freeFlight <- readIORef free
   position <- query robot (cyMePosition robot)
   heading <- query robot (cyMeHeading robot)
@@ -82,6 +90,7 @@ turnBot free robot = do
       drive robot throttle yaw climb
       scan robot (contactBearing t) 20 (contactElevation t)
       power <- query robot (cyGunPowerForFlightTime robot (contactRange t) 1)
+      -- cyGunLead is the intercept if the target holds course.
       solution <- with t $ \ptr -> optional robot (cyGunLead robot ptr power)
       let (aimHeading,aimPitch) = maybe (contactBearing t,contactElevation t) (\s -> (solutionHeading s,solutionPitch s)) solution
       cyGunAimHeading robot aimHeading >>= check robot
@@ -114,6 +123,19 @@ turnBot free robot = do
           drive robot 0.5 0.33 climb
           scan robot sweep 40 (if freeFlight then fromIntegral ((tick `div` 10) `mod` 3-1)*35 else 0)
           showStatus robot "SEARCH" Nothing
+  -- A simple dodge: vary it, or predict the shooter.
+  (taken,ends) <- readIORef dodging
+  shot <- if tick >= ends then heardShot robot else pure False
+  when shot $ writeIORef dodging (taken+1, tick+10)
+  (dodges,dodgeEnd) <- readIORef dodging
+  when (tick < dodgeEnd) $ do
+    -- Off the line of fire: left, then right next time (turn is positive left, strafe positive right).
+    let left = odd (dodges :: Int)
+    control <- query robot (cyMatchControl robot)
+    if control == cyControlForces
+      then cyDriveThrottle robot 0.5 >>= check robot >> cyDriveStrafe robot (if left then -1 else 1) >>= check robot
+      else cyDriveThrottle robot 1 >>= check robot >> cyDriveTurn robot (if left then 1 else -1) >>= check robot
+    showStatus robot (if left then "dodge:left" else "dodge:right") (Just (fromIntegral dodges))
   charge <- query robot (cyBatteryCharge robot)
   capacity <- query robot (cyBatteryCapacity robot)
   when (charge < capacity/4) $ do
@@ -139,4 +161,5 @@ turnBot free robot = do
         drive robot 0.8 yaw climb
 main = do
   free <- newIORef False
-  run (turnBot free) (start free)
+  dodging <- newIORef (0, 0) -- dodges taken, and the tick the current one ends
+  run (turnBot free dodging) (start free)
